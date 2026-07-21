@@ -158,3 +158,51 @@ type Converter interface {
     Convert(source Input) Output
 }
 ```
+
+## struct:assign:presence [REGEX] [TEMPLATE]
+
+`struct:assign:presence [REGEX] [TEMPLATE]` can be defined as
+[CLI argument](./define-settings.md#cli),
+[conversion comment](./define-settings.md#conversion) or
+[method comment](./define-settings.md#method) and is
+[inheritable](./define-settings.md#inheritance).
+
+Declaring `struct:assign:presence` makes goverter guard each automatically matched
+member with a **presence method** on the source: when that method exists and
+reports the value is set, the member is assigned; otherwise it is skipped. This is
+useful for the [gRPC/protobuf Opaque API](https://go.dev/blog/protobuf-opaque),
+where `oneof` and `optional` fields are read through `HasX()` accessors.
+
+Presence methods are recognized the same way setters are: `REGEX` is matched
+against the full source method name and `TEMPLATE` extracts the field name that
+method guards. The defaults are equivalent to:
+
+```go
+// goverter:struct:assign:presence Has(.*) $1
+```
+
+so a source method `HasEmail` guards the field `Email`. A member is guarded when
+the extracted field name equals the name the member maps from. The presence method
+must take no arguments and return a single `bool`. This applies to both field and
+setter targets.
+
+The setting is **opportunistic**: if no matching presence method exists on the
+source, the member is assigned unguarded. Members addressed by an explicit
+[`goverter:map`](./map.md) are never guarded.
+
+::: code-group
+<<< @../../example/struct-assign-presence/input.go
+<<< @../../example/struct-assign-presence/generated/generated.go [generated/generated.go]
+:::
+
+The matched field name is compared **before** the value template is applied, so it
+is the field name or the [`struct:assign:setter`](#struct-assign-setter-regex-template)
+capture — not the resolved source value. With source getters
+(`struct:assign:source Get(.*)`), the setter `SetEmail` is still guarded by
+`HasEmail` (both resolve to `Email`) while reading the value from `GetEmail()`.
+
+To match a different presence naming scheme, pass a regex and template:
+
+```go
+// goverter:struct:assign:presence Present(.*) $1
+```

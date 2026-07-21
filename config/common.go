@@ -32,6 +32,9 @@ type Common struct {
 	SourceRegex                        *regexp.Regexp
 	SourceTemplate                     string
 	SetterPrefer                       string
+	AssignPresence                     bool
+	PresenceRegex                      *regexp.Regexp
+	PresenceTemplate                   string
 }
 
 func parseCommon(c *Common, cmd, rest string) (fieldSetting bool, err error) {
@@ -95,6 +98,10 @@ func parseCommon(c *Common, cmd, rest string) (fieldSetting bool, err error) {
 	case "struct:assign:prefer":
 		fieldSetting = true
 		c.SetterPrefer, err = parse.Enum(false, rest, "field", "method")
+	case "struct:assign:presence":
+		fieldSetting = true
+		c.AssignPresence = true
+		c.PresenceRegex, c.PresenceTemplate, err = parsePresence(rest)
 	case "":
 		err = fmt.Errorf("missing setting key")
 	default:
@@ -172,6 +179,34 @@ func parseSource(rest string) (*regexp.Regexp, string, error) {
 	if len(parts) == 2 {
 		if trimmed := strings.TrimSpace(parts[1]); trimmed != "" {
 			template = trimmed
+		}
+	}
+	return regex, template, nil
+}
+
+// parsePresence parses the "struct:assign:presence" value, an optional regex
+// followed by an optional replacement template. Mirroring struct:assign:setter,
+// the regex matches a source presence method name and the template extracts the
+// field name that method guards (e.g. "HasName" -> "Name"). An empty value keeps
+// the defaults ("Has(.*)" / "$1"), so declaring the setting with no arguments
+// simply enables presence checking for the "HasX" convention.
+func parsePresence(rest string) (*regexp.Regexp, string, error) {
+	trimmed := strings.TrimSpace(rest)
+	if trimmed == "" {
+		return regexp.MustCompile(`Has(.*)`), "$1", nil
+	}
+	parts := strings.SplitN(trimmed, " ", 2)
+	regex, err := regexp.Compile(parts[0])
+	if err != nil {
+		return nil, "", err
+	}
+	if regex.NumSubexp() < 1 {
+		return nil, "", fmt.Errorf("presence regex %q must contain at least one capture group to extract the field name", parts[0])
+	}
+	template := "$1"
+	if len(parts) == 2 {
+		if t := strings.TrimSpace(parts[1]); t != "" {
+			template = t
 		}
 	}
 	return regex, template, nil

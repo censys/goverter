@@ -57,6 +57,7 @@ These settings can be defined as [CLI argument](./define-settings.md#cli),
 - [`struct:assign:setter REGEX [TEMPLATE]` configure setter method recognition](./struct.md#struct-assign-setter-regex-template)
 - [`struct:assign:source REGEX [TEMPLATE]` configure source accessor (getter) recognition](./struct.md#struct-assign-source-regex-template)
 - [`struct:assign:prefer KIND` resolve field/setter collisions](./struct.md#struct-assign-prefer-kind)
+- [`struct:assign:presence [REGEX] [TEMPLATE]` guard assignments with a source presence method](./struct.md#struct-assign-presence-regex-template)
 - [`update:ignoreZeroValueField [yes:no]` don't update fields with zero values](./update.md#update-ignorezerovaluefield-yes-no)
 - [`useUnderlyingTypeMethods [yes|no]` use underlying types when looking for existing methods](./useUnderlyingTypeMethods.md)
 - [`useZeroValueOnPointerInconsistency [yes|no]` Use zero values for `*S` to `T` conversions](./useZeroValueOnPointerInconsistency.md)

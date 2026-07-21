@@ -1,0 +1,19 @@
+input:
+    input.go: |
+        package execution
+
+        // goverter:converter
+        type Converter interface {
+            // goverter:struct:assign:presence Has.*
+            Convert(source Input) Output
+        }
+
+        type Input struct{ Content string }
+
+        type Output struct{ Content string }
+error: |-
+    error parsing 'goverter:struct:assign:presence' at
+        @workdir/input.go:6
+        func (github.com/jmattheis/goverter/execution.Converter).Convert(source github.com/jmattheis/goverter/execution.Input) github.com/jmattheis/goverter/execution.Output
+
+    presence regex "Has.*" must contain at least one capture group to extract the field name

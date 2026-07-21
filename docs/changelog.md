@@ -16,6 +16,9 @@ import GH from './GH.vue';
   to recognize source accessor methods (e.g. `GetX()` getters) by regex and
   normalize them to the field name they provide, the source-side mirror of
   `struct:assign:setter`. <GH issue="179"/>
+- Add [`struct:assign:presence`](./reference/struct.md#struct-assign-presence-regex-template)
+  to guard member assignments with a source presence method (e.g. the `HasX()`
+  accessors for protobuf Opaque API `oneof`/`optional` fields). <GH issue="179"/>
 
 ## v1.9.4
 

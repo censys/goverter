@@ -26,11 +26,14 @@ const (
 )
 
 var DefaultCommon = Common{
-	Enum:           enum.Config{Enabled: true},
-	AssignFields:   true,
-	AssignSetters:  false,
-	SetterRegex:    regexp.MustCompile(`Set(.*)`),
-	SetterTemplate: "$1",
+	Enum:             enum.Config{Enabled: true},
+	AssignFields:     true,
+	AssignSetters:    false,
+	SetterRegex:      regexp.MustCompile(`Set(.*)`),
+	SetterTemplate:   "$1",
+	AssignPresence:   false,
+	PresenceRegex:    regexp.MustCompile(`Has(.*)`),
+	PresenceTemplate: "$1",
 }
 
 var DefaultConfigInterface = ConverterConfig{

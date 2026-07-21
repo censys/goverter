@@ -56,7 +56,7 @@ func (s *Struct) Assign(gen Generator, ctx *MethodContext, assignTo *AssignTo, s
 		memberName := obj.Name()
 
 		// outputName is the name of the output member this obj covers, and is what
-		// everything keys on: goverter:map/ignore, coverage, field/setter
+		// everything keys on: goverter:map/ignore, coverage, presence, field/setter
 		// collision, and the source auto-match. For a field it's the field name; for
 		// a setter it's the setter regex/template result (default $1 == the first
 		// capture, e.g. SetEmail -> Email). The matching source value is then found
@@ -173,6 +173,11 @@ func (s *Struct) Assign(gen Generator, ctx *MethodContext, assignTo *AssignTo, s
 			if shouldCheckAgainstZero(ctx, nextSource, targetFieldType, assignTo.Update, false) {
 				memberStmt = []jen.Code{jen.If(nextID.Code.Clone().Op("!=").Add(xtype.ZeroValue(nextSource.T))).Block(memberStmt...)}
 			}
+			if !explicit {
+				if cond := presenceCondition(ctx, sourceID, source, outputName); cond != nil {
+					memberStmt = []jen.Code{jen.If(cond).Block(memberStmt...)}
+				}
+			}
 			stmt = append(stmt, memberStmt...)
 		} else {
 			def := fieldMapping.Function
@@ -221,6 +226,11 @@ func (s *Struct) Assign(gen Generator, ctx *MethodContext, assignTo *AssignTo, s
 
 			if shouldCheckAgainstZero(ctx, functionCallSourceType, targetFieldType, assignTo.Update, true) {
 				callStmt = []jen.Code{jen.If(functionCallSourceID.Code.Clone().Op("!=").Add(xtype.ZeroValue(functionCallSourceType.T))).Block(callStmt...)}
+			}
+			if !explicit {
+				if cond := presenceCondition(ctx, sourceID, source, outputName); cond != nil {
+					callStmt = []jen.Code{jen.If(cond).Block(callStmt...)}
+				}
 			}
 			stmt = append(stmt, callStmt...)
 		}
@@ -377,6 +387,51 @@ func setterCallStmt(gen Generator, ctx *MethodContext, assignTo *AssignTo, metho
 		return nil, NewError(fmt.Sprintf("Setter method %s returns error but the conversion method does not return error.", methodName))
 	}
 	return []jen.Code{jen.If(jen.Id("err").Op(":=").Add(call), jen.Id("err").Op("!=").Nil()).Block(ret)}, nil
+}
+
+// presenceCondition returns a boolean condition that guards a member assignment
+// when goverter:struct:assign:presence is enabled and the source exposes a
+// matching presence method. Mirroring the setter regex/template direction, the
+// presence regex matches a source method name and the template extracts the field
+// name that method guards (default "Has(.*)" / "$1"): a source method HasEmail
+// yields field Email. The member is guarded when some source presence method's
+// extracted field name equals presenceBase (the field this member maps from). The
+// method must take no arguments and return a single bool, like proto's HasX()
+// oneof/optional accessors. When no such method exists, it returns nil and the
+// assignment stays unguarded (opportunistic).
+func presenceCondition(ctx *MethodContext, sourceID *xtype.JenID, source *xtype.Type, presenceBase string) *jen.Statement {
+	if !ctx.Conf.AssignPresence || !source.Named {
+		return nil
+	}
+
+	ms := types.NewMethodSet(types.NewPointer(source.NamedType))
+	for i := 0; i < ms.Len(); i++ {
+		fn, ok := ms.At(i).Obj().(*types.Func)
+		if !ok {
+			continue
+		}
+		name := fn.Name()
+		idx := ctx.Conf.PresenceRegex.FindStringSubmatchIndex(name)
+		if idx == nil || idx[0] != 0 || idx[1] != len(name) || len(idx) < 4 {
+			continue
+		}
+		field := string(ctx.Conf.PresenceRegex.ExpandString(nil, ctx.Conf.PresenceTemplate, name, idx))
+		if field == "" || field != presenceBase {
+			continue
+		}
+		sig, ok := fn.Type().(*types.Signature)
+		if !ok || sig.Params().Len() != 0 || sig.Results().Len() != 1 {
+			continue
+		}
+		if basic, ok := sig.Results().At(0).Type().(*types.Basic); !ok || basic.Kind() != types.Bool {
+			continue
+		}
+		if !xtype.Accessible(fn, ctx.OutputPackagePath) {
+			continue
+		}
+		return sourceID.Code.Clone().Dot(name).Call()
+	}
+	return nil
 }
 
 func setterCollisionError(outputName string) string {
