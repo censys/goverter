@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"regexp"
+	"strings"
 
 	"github.com/jmattheis/goverter/config/parse"
 	"github.com/jmattheis/goverter/enum"
@@ -24,6 +25,16 @@ type Common struct {
 	DefaultUpdate                      bool
 	ArgContextRegex                    *regexp.Regexp
 	Enum                               enum.Config
+	AssignFields                       bool
+	AssignSetters                      bool
+	SetterRegex                        *regexp.Regexp
+	SetterTemplate                     string
+	SourceRegex                        *regexp.Regexp
+	SourceTemplate                     string
+	SetterPrefer                       string
+	AssignPresence                     bool
+	PresenceRegex                      *regexp.Regexp
+	PresenceTemplate                   string
 }
 
 func parseCommon(c *Common, cmd, rest string) (fieldSetting bool, err error) {
@@ -75,6 +86,22 @@ func parseCommon(c *Common, cmd, rest string) (fieldSetting bool, err error) {
 		if err == nil && IsEnumAction(c.Enum.Unknown) {
 			err = validateEnumAction(c.Enum.Unknown)
 		}
+	case "struct:assign":
+		fieldSetting = true
+		c.AssignFields, c.AssignSetters, err = parseAssign(rest)
+	case "struct:assign:setter":
+		fieldSetting = true
+		c.SetterRegex, c.SetterTemplate, err = parseSetter(rest)
+	case "struct:assign:source":
+		fieldSetting = true
+		c.SourceRegex, c.SourceTemplate, err = parseSource(rest)
+	case "struct:assign:prefer":
+		fieldSetting = true
+		c.SetterPrefer, err = parse.Enum(false, rest, "field", "method")
+	case "struct:assign:presence":
+		fieldSetting = true
+		c.AssignPresence = true
+		c.PresenceRegex, c.PresenceTemplate, err = parsePresence(rest)
 	case "":
 		err = fmt.Errorf("missing setting key")
 	default:
@@ -82,4 +109,105 @@ func parseCommon(c *Common, cmd, rest string) (fieldSetting bool, err error) {
 	}
 
 	return fieldSetting, err
+}
+
+// parseAssign parses the "struct:assign" value, which is a space separated list
+// containing "field" and/or "method". It returns whether target fields and/or
+// setter methods should be part of the assignment coverage.
+func parseAssign(rest string) (assignFields, assignSetters bool, err error) {
+	fields := strings.Fields(rest)
+	if len(fields) == 0 {
+		return false, false, fmt.Errorf("must have at least one value: field, method")
+	}
+	for _, f := range fields {
+		switch f {
+		case "field":
+			if assignFields {
+				return false, false, fmt.Errorf("duplicate value: field")
+			}
+			assignFields = true
+		case "method":
+			if assignSetters {
+				return false, false, fmt.Errorf("duplicate value: method")
+			}
+			assignSetters = true
+		default:
+			return false, false, fmt.Errorf("invalid value: '%s' must be one of: field, method", f)
+		}
+	}
+	return assignFields, assignSetters, nil
+}
+
+// parseSetter parses the "struct:assign:setter" value, which is a regex followed
+// by an optional replacement template used to derive the source field name from a
+// setter method name. The template defaults to "$1" (the first capture group).
+func parseSetter(rest string) (*regexp.Regexp, string, error) {
+	parts := strings.SplitN(strings.TrimSpace(rest), " ", 2)
+	regex, err := regexp.Compile(parts[0])
+	if err != nil {
+		return nil, "", err
+	}
+	if regex.NumSubexp() < 1 {
+		return nil, "", fmt.Errorf("setter regex %q must contain at least one capture group to extract the field name", parts[0])
+	}
+	template := "$1"
+	if len(parts) == 2 {
+		if trimmed := strings.TrimSpace(parts[1]); trimmed != "" {
+			template = trimmed
+		}
+	}
+	return regex, template, nil
+}
+
+// parseSource parses the "struct:assign:source" value, a regex followed by an
+// optional replacement template used to normalize a source accessor method name
+// (e.g. a getter) into the output field name it provides. The template defaults to
+// "$1" (the first capture group), so "Get(.*)" makes a source method GetEmail()
+// provide the value for output field Email. It is the source-side mirror of
+// struct:assign:setter and is generic — any prefix/suffix convention works, not
+// just getters.
+func parseSource(rest string) (*regexp.Regexp, string, error) {
+	parts := strings.SplitN(strings.TrimSpace(rest), " ", 2)
+	regex, err := regexp.Compile(parts[0])
+	if err != nil {
+		return nil, "", err
+	}
+	if regex.NumSubexp() < 1 {
+		return nil, "", fmt.Errorf("source regex %q must contain at least one capture group to extract the field name", parts[0])
+	}
+	template := "$1"
+	if len(parts) == 2 {
+		if trimmed := strings.TrimSpace(parts[1]); trimmed != "" {
+			template = trimmed
+		}
+	}
+	return regex, template, nil
+}
+
+// parsePresence parses the "struct:assign:presence" value, an optional regex
+// followed by an optional replacement template. Mirroring struct:assign:setter,
+// the regex matches a source presence method name and the template extracts the
+// field name that method guards (e.g. "HasName" -> "Name"). An empty value keeps
+// the defaults ("Has(.*)" / "$1"), so declaring the setting with no arguments
+// simply enables presence checking for the "HasX" convention.
+func parsePresence(rest string) (*regexp.Regexp, string, error) {
+	trimmed := strings.TrimSpace(rest)
+	if trimmed == "" {
+		return regexp.MustCompile(`Has(.*)`), "$1", nil
+	}
+	parts := strings.SplitN(trimmed, " ", 2)
+	regex, err := regexp.Compile(parts[0])
+	if err != nil {
+		return nil, "", err
+	}
+	if regex.NumSubexp() < 1 {
+		return nil, "", fmt.Errorf("presence regex %q must contain at least one capture group to extract the field name", parts[0])
+	}
+	template := "$1"
+	if len(parts) == 2 {
+		if t := strings.TrimSpace(parts[1]); t != "" {
+			template = t
+		}
+	}
+	return regex, template, nil
 }

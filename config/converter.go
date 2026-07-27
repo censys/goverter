@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"go/types"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"github.com/jmattheis/goverter/config/parse"
@@ -25,7 +26,14 @@ const (
 )
 
 var DefaultCommon = Common{
-	Enum: enum.Config{Enabled: true},
+	Enum:             enum.Config{Enabled: true},
+	AssignFields:     true,
+	AssignSetters:    false,
+	SetterRegex:      regexp.MustCompile(`Set(.*)`),
+	SetterTemplate:   "$1",
+	AssignPresence:   false,
+	PresenceRegex:    regexp.MustCompile(`Has(.*)`),
+	PresenceTemplate: "$1",
 }
 
 var DefaultConfigInterface = ConverterConfig{

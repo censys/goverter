@@ -6,6 +6,20 @@ import GH from './GH.vue';
 
 ## unreleased
 
+- Add [`struct:assign`](./reference/struct.md#struct-assign-strategy) to assign
+  target struct members through setter methods (e.g. the gRPC/protobuf Opaque
+  API), configurable via
+  [`struct:assign:setter`](./reference/struct.md#struct-assign-setter-regex-template)
+  and [`struct:assign:prefer`](./reference/struct.md#struct-assign-prefer-kind).
+  <GH issue="179"/>
+- Add [`struct:assign:source`](./reference/struct.md#struct-assign-source-regex-template)
+  to recognize source accessor methods (e.g. `GetX()` getters) by regex and
+  normalize them to the field name they provide, the source-side mirror of
+  `struct:assign:setter`. <GH issue="179"/>
+- Add [`struct:assign:presence`](./reference/struct.md#struct-assign-presence-regex-template)
+  to guard member assignments with a source presence method (e.g. the `HasX()`
+  accessors for protobuf Opaque API `oneof`/`optional` fields). <GH issue="179"/>
+
 ## v1.9.4
 
 - Fix [`default:update`](./reference/default.md) not applying zero value checks

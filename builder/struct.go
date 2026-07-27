@@ -2,6 +2,7 @@ package builder
 
 import (
 	"fmt"
+	"go/token"
 	"go/types"
 	"strings"
 
@@ -37,53 +38,147 @@ func (s *Struct) Assign(gen Generator, ctx *MethodContext, assignTo *AssignTo, s
 	stmt := []jen.Code{}
 
 	definedFields := ctx.DefinedFields(target)
+	// assignedOutput tracks the output names already covered by an auto-resolved
+	// member, so a field and a setter that cover the same output name don't both get
+	// assigned (collision handling for "struct:assign field method").
+	assignedOutput := map[string]bool{}
+	// explicitOutput holds the output names claimed by members that carry an
+	// explicit goverter:map. Such a map always wins, so a competing auto-matched
+	// member sharing that output name is skipped rather than also assigned — e.g. a
+	// goverter:map naming the setter SetEmail suppresses the field Email, and vice
+	// versa.
+	explicitOutput := explicitOutputNames(ctx, target)
 	usedSourceID := false
-	for i := 0; i < target.StructType.NumFields(); i++ {
-		targetField := target.StructType.Field(i)
-		delete(definedFields, targetField.Name())
+	// objectsToMap yields both kinds of target member as a types.Object: a field
+	// (e.g. "Name string") and a setter method (e.g. "SetName(string)"). The loop
+	// handles both uniformly.
+	for _, obj := range objectsToMap(ctx, target) {
+		memberName := obj.Name()
 
-		fieldMapping := ctx.Field(target, targetField.Name())
+		// outputName is the name of the output member this obj covers, and is what
+		// everything keys on: goverter:map/ignore, coverage, presence, field/setter
+		// collision, and the source auto-match. For a field it's the field name; for
+		// a setter it's the setter regex/template result (default $1 == the first
+		// capture, e.g. SetEmail -> Email). The matching source value is then found
+		// by output name, with source getters normalized via struct:assign:source.
+		outputName := memberName
+		targetFieldType := xtype.TypeOf(obj.Type())
+		setter := false
+		setterReturnsErr := false
+
+		var sig *types.Signature
+		setterRecognized := false
+		if fn, ok := obj.(*types.Func); ok {
+			sig, _ = fn.Type().(*types.Signature)
+			if sig != nil {
+				outputName, setterRecognized = setterName(ctx, memberName)
+			}
+		}
+
+		// Resolve the goverter:map/ignore addressing this member. It is keyed by the
+		// member's own name — the field name for a field, the method name (SetValues)
+		// for a setter — so an explicit map/ignore references a setter directly, just
+		// like it references a field.
+		delete(definedFields, memberName)
+		fieldMapping := ctx.Field(target, memberName)
 
 		if fieldMapping.Ignore {
 			continue
 		}
-		if !targetField.Exported() && ctx.Conf.IgnoreUnexported {
+		if !obj.Exported() && ctx.Conf.IgnoreUnexported {
 			continue
 		}
 
-		if !xtype.Accessible(targetField, ctx.OutputPackagePath) {
-			cause := unexportedStructError(targetField.Name(), source.String, target.String)
+		// explicit means the member is addressed by an explicit goverter:map, which
+		// always wins over automatic matching and bypasses collision handling.
+		explicit := fieldMapping.Source != "" || fieldMapping.Function != nil
+
+		if _, ok := obj.(*types.Func); ok {
+			if !setterRecognized && !explicit {
+				// not a setter (e.g. String/Validate) and not explicitly mapped
+				continue
+			}
+			paramType, returnsErr, sErr := setterSignature(memberName, sig)
+			if sErr != nil {
+				return nil, sErr
+			}
+			targetFieldType = paramType
+			setter = true
+			setterReturnsErr = returnsErr
+		}
+
+		if !explicit && explicitOutput[outputName] {
+			// an explicit goverter:map on a sibling member already claims this
+			// output name; that map wins, so skip this auto-matched member.
+			continue
+		}
+
+		if !xtype.Accessible(obj, ctx.OutputPackagePath) {
+			cause := unexportedStructError(memberName, source.String, target.String)
 			return nil, NewError(cause).Lift(&Path{
 				Prefix:     ".",
 				SourceID:   "???",
-				TargetID:   targetField.Name(),
-				TargetType: targetField.Type().String(),
+				TargetID:   memberName,
+				TargetType: obj.Type().String(),
 			})
 		}
 
-		targetFieldType := xtype.TypeOf(targetField.Type())
-		targetFieldPath := errPath.Field(targetField.Name())
+		if !explicit && assignedOutput[outputName] {
+			if ctx.Conf.SetterPrefer != "" {
+				// a preferred member already consumed this output name
+				continue
+			}
+			return nil, NewError(setterCollisionError(outputName)).Lift(&Path{
+				Prefix:     ".",
+				TargetID:   memberName,
+				TargetType: targetFieldType.String,
+			})
+		}
+
+		targetFieldPath := errPath.Field(memberName)
+		// synthetic var carrying the member name plus the type to convert into
+		// (the field type, or the setter's single parameter type).
+		targetField := types.NewVar(token.NoPos, nil, memberName, targetFieldType.T)
 
 		if fieldMapping.Function == nil {
-			usedSourceID = true
-			nextID, nextSource, mapStmt, lift, skip, err := mapField(gen, ctx, targetField, sourceID, source, target, additionalFieldSources, targetFieldPath)
+			nextID, nextSource, mapStmt, lift, skip, err := mapField(gen, ctx, outputName, targetField, sourceID, source, fieldMapping, additionalFieldSources, targetFieldPath)
 			if skip {
 				continue
 			}
 			if err != nil {
 				return nil, err
 			}
+			usedSourceID = true
 			stmt = append(stmt, mapStmt...)
 
-			fieldStmt, err := gen.Assign(ctx, AssignOf(assignTo.Stmt.Clone().Dot(targetField.Name())), nextID, nextSource, targetFieldType, targetFieldPath)
-			if err != nil {
-				return nil, err.Lift(lift...)
-			}
-			if shouldCheckAgainstZero(ctx, nextSource, targetFieldType, assignTo.Update, false) {
-				stmt = append(stmt, jen.If(nextID.Code.Clone().Op("!=").Add(xtype.ZeroValue(nextSource.T))).Block(fieldStmt...))
+			var memberStmt []jen.Code
+			if setter {
+				buildStmt, valueID, err := gen.Build(ctx, nextID, nextSource, targetFieldType, targetFieldPath)
+				if err != nil {
+					return nil, err.Lift(lift...)
+				}
+				callStmt, err := setterCallStmt(gen, ctx, assignTo, memberName, valueID.Code, setterReturnsErr, targetFieldPath)
+				if err != nil {
+					return nil, err.Lift(lift...)
+				}
+				memberStmt = append(buildStmt, callStmt...)
 			} else {
-				stmt = append(stmt, fieldStmt...)
+				fieldStmt, err := gen.Assign(ctx, AssignOf(assignTo.Stmt.Clone().Dot(memberName)), nextID, nextSource, targetFieldType, targetFieldPath)
+				if err != nil {
+					return nil, err.Lift(lift...)
+				}
+				memberStmt = fieldStmt
 			}
+
+			if shouldCheckAgainstZero(ctx, nextSource, targetFieldType, assignTo.Update, false) {
+				memberStmt = []jen.Code{jen.If(nextID.Code.Clone().Op("!=").Add(xtype.ZeroValue(nextSource.T))).Block(memberStmt...)}
+			}
+			if !explicit {
+				if cond := presenceCondition(ctx, sourceID, source, outputName); cond != nil {
+					memberStmt = []jen.Code{jen.If(cond).Block(memberStmt...)}
+				}
+			}
+			stmt = append(stmt, memberStmt...)
 		} else {
 			def := fieldMapping.Function
 
@@ -92,7 +187,7 @@ func (s *Struct) Assign(gen Generator, ctx *MethodContext, assignTo *AssignTo, s
 			var functionCallSourceType *xtype.Type
 			if def.Source != nil {
 				usedSourceID = true
-				nextID, nextSource, mapStmt, mapLift, _, err := mapField(gen, ctx, targetField, sourceID, source, target, additionalFieldSources, targetFieldPath)
+				nextID, nextSource, mapStmt, mapLift, _, err := mapField(gen, ctx, outputName, targetField, sourceID, source, fieldMapping, additionalFieldSources, targetFieldPath)
 				if err != nil {
 					return nil, err
 				}
@@ -110,7 +205,7 @@ func (s *Struct) Assign(gen Generator, ctx *MethodContext, assignTo *AssignTo, s
 			} else {
 				sourceLift = append(sourceLift, &Path{
 					Prefix:     ".",
-					TargetID:   targetField.Name(),
+					TargetID:   memberName,
 					TargetType: targetFieldType.String,
 				})
 			}
@@ -119,13 +214,29 @@ func (s *Struct) Assign(gen Generator, ctx *MethodContext, assignTo *AssignTo, s
 			if err != nil {
 				return nil, err.Lift(sourceLift...)
 			}
-			callStmt = append(callStmt, assignTo.Stmt.Clone().Dot(targetField.Name()).Op("=").Add(callReturnID.Code))
+			if setter {
+				sc, err := setterCallStmt(gen, ctx, assignTo, memberName, callReturnID.Code, setterReturnsErr, targetFieldPath)
+				if err != nil {
+					return nil, err.Lift(sourceLift...)
+				}
+				callStmt = append(callStmt, sc...)
+			} else {
+				callStmt = append(callStmt, assignTo.Stmt.Clone().Dot(memberName).Op("=").Add(callReturnID.Code))
+			}
 
 			if shouldCheckAgainstZero(ctx, functionCallSourceType, targetFieldType, assignTo.Update, true) {
-				stmt = append(stmt, jen.If(functionCallSourceID.Code.Clone().Op("!=").Add(xtype.ZeroValue(functionCallSourceType.T))).Block(callStmt...))
-			} else {
-				stmt = append(stmt, callStmt...)
+				callStmt = []jen.Code{jen.If(functionCallSourceID.Code.Clone().Op("!=").Add(xtype.ZeroValue(functionCallSourceType.T))).Block(callStmt...)}
 			}
+			if !explicit {
+				if cond := presenceCondition(ctx, sourceID, source, outputName); cond != nil {
+					callStmt = []jen.Code{jen.If(cond).Block(callStmt...)}
+				}
+			}
+			stmt = append(stmt, callStmt...)
+		}
+
+		if !explicit {
+			assignedOutput[outputName] = true
 		}
 	}
 	if !usedSourceID {
@@ -141,6 +252,197 @@ func (s *Struct) Assign(gen Generator, ctx *MethodContext, assignTo *AssignTo, s
 	}
 
 	return stmt, nil
+}
+
+// objectsToMap returns the target members that must be satisfied from the source:
+// struct fields (when goverter:struct:assign includes "field") and/or setter
+// methods (when it includes "method"). types.Var (field) and types.Func (method)
+// both implement types.Object, so the assignment loop handles them uniformly.
+func objectsToMap(ctx *MethodContext, target *xtype.Type) []types.Object {
+	var fields, setters []types.Object
+	if ctx.Conf.AssignFields {
+		for i := 0; i < target.StructType.NumFields(); i++ {
+			fields = append(fields, target.StructType.Field(i))
+		}
+	}
+	if ctx.Conf.AssignSetters && target.Named {
+		// setters have pointer receivers; the pointer method set also includes
+		// promoted methods from embedded structs.
+		ms := types.NewMethodSet(types.NewPointer(target.NamedType))
+		for i := 0; i < ms.Len(); i++ {
+			if fn, ok := ms.At(i).Obj().(*types.Func); ok {
+				setters = append(setters, fn)
+			}
+		}
+	}
+	if ctx.Conf.SetterPrefer == "method" {
+		return append(setters, fields...)
+	}
+	return append(fields, setters...)
+}
+
+// setterName derives, from a candidate setter method name, the output field name
+// it covers (via the setter regex/template, default "$1" == the first capture, so
+// SetEmail -> Email). recognized is false when the name doesn't fully match the
+// setter regex or the template expands to empty, meaning the method is not a setter
+// (e.g. String/Validate); the output name then falls back to the method name.
+func setterName(ctx *MethodContext, name string) (outputName string, recognized bool) {
+	idx := ctx.Conf.SetterRegex.FindStringSubmatchIndex(name)
+	if idx == nil || idx[0] != 0 || idx[1] != len(name) || len(idx) < 4 {
+		return name, false
+	}
+	outputName = string(ctx.Conf.SetterRegex.ExpandString(nil, ctx.Conf.SetterTemplate, name, idx))
+	if outputName == "" {
+		return name, false
+	}
+	return outputName, true
+}
+
+// sourceNameNormalizer builds the source-side name normalizer from
+// struct:assign:source: it rewrites an accessor method name (e.g. a getter) into
+// the output field name it provides via the configured regex/template, mirroring
+// setterName on the source side. It returns nil when struct:assign:source is not
+// configured, leaving source matching exact-name only.
+func sourceNameNormalizer(ctx *MethodContext) xtype.NameNormalizer {
+	regex := ctx.Conf.SourceRegex
+	if regex == nil {
+		return nil
+	}
+	template := ctx.Conf.SourceTemplate
+	return func(methodName string) (string, bool) {
+		idx := regex.FindStringSubmatchIndex(methodName)
+		if idx == nil || idx[0] != 0 || idx[1] != len(methodName) || len(idx) < 4 {
+			return "", false
+		}
+		normalized := string(regex.ExpandString(nil, template, methodName, idx))
+		if normalized == "" {
+			return "", false
+		}
+		return normalized, true
+	}
+}
+
+// explicitOutputNames collects the output names of target members that carry an
+// explicit goverter:map (a source path or a conversion function), keyed by each
+// member's own name. The assignment loop skips any auto-matched member whose
+// output name is claimed here, so an explicit map on one member suppresses a
+// competing sibling covering the same output name (e.g. a map naming the setter
+// SetEmail suppresses the field Email, and vice versa), letting the map win.
+func explicitOutputNames(ctx *MethodContext, target *xtype.Type) map[string]bool {
+	explicit := map[string]bool{}
+	for _, obj := range objectsToMap(ctx, target) {
+		memberName := obj.Name()
+		fieldMapping := ctx.Field(target, memberName)
+		if fieldMapping.Source == "" && fieldMapping.Function == nil {
+			continue
+		}
+		outputName := memberName
+		if _, ok := obj.(*types.Func); ok {
+			outputName, _ = setterName(ctx, memberName)
+		}
+		explicit[outputName] = true
+	}
+	return explicit
+}
+
+// setterSignature validates that a candidate setter method has exactly one
+// parameter and returns nothing or a single error. It returns the parameter type
+// (the type a source value must be converted into) and whether it returns an error.
+func setterSignature(name string, sig *types.Signature) (*xtype.Type, bool, *Error) {
+	liftErr := func(cause string) *Error {
+		return NewError(cause).Lift(&Path{
+			Prefix:     ".",
+			SourceID:   "???",
+			TargetID:   name,
+			TargetType: "???",
+		})
+	}
+	if sig == nil || sig.Params().Len() != 1 {
+		return nil, false, liftErr(fmt.Sprintf("Setter method %s must have exactly one parameter.", name))
+	}
+	returnsErr := false
+	switch sig.Results().Len() {
+	case 0:
+	case 1:
+		if !isErrorType(sig.Results().At(0).Type()) {
+			return nil, false, liftErr(fmt.Sprintf("Setter method %s must return nothing or a single error, but returns %s.", name, sig.Results().At(0).Type()))
+		}
+		returnsErr = true
+	default:
+		return nil, false, liftErr(fmt.Sprintf("Setter method %s must return nothing or a single error.", name))
+	}
+	return xtype.TypeOf(sig.Params().At(0).Type()), returnsErr, nil
+}
+
+// setterCallStmt emits the statements that call a setter method with the given
+// value. For an error-returning setter it wraps the call in an error check that
+// returns via the converter method (which must therefore return an error too).
+func setterCallStmt(gen Generator, ctx *MethodContext, assignTo *AssignTo, methodName string, value *jen.Statement, returnsErr bool, errPath ErrorPath) ([]jen.Code, *Error) {
+	call := assignTo.Stmt.Clone().Dot(methodName).Call(value.Clone())
+	if !returnsErr {
+		return []jen.Code{call}, nil
+	}
+	ret, ok := gen.ReturnError(ctx, errPath, jen.Id("err"))
+	if !ok {
+		return nil, NewError(fmt.Sprintf("Setter method %s returns error but the conversion method does not return error.", methodName))
+	}
+	return []jen.Code{jen.If(jen.Id("err").Op(":=").Add(call), jen.Id("err").Op("!=").Nil()).Block(ret)}, nil
+}
+
+// presenceCondition returns a boolean condition that guards a member assignment
+// when goverter:struct:assign:presence is enabled and the source exposes a
+// matching presence method. Mirroring the setter regex/template direction, the
+// presence regex matches a source method name and the template extracts the field
+// name that method guards (default "Has(.*)" / "$1"): a source method HasEmail
+// yields field Email. The member is guarded when some source presence method's
+// extracted field name equals presenceBase (the field this member maps from). The
+// method must take no arguments and return a single bool, like proto's HasX()
+// oneof/optional accessors. When no such method exists, it returns nil and the
+// assignment stays unguarded (opportunistic).
+func presenceCondition(ctx *MethodContext, sourceID *xtype.JenID, source *xtype.Type, presenceBase string) *jen.Statement {
+	if !ctx.Conf.AssignPresence || !source.Named {
+		return nil
+	}
+
+	ms := types.NewMethodSet(types.NewPointer(source.NamedType))
+	for i := 0; i < ms.Len(); i++ {
+		fn, ok := ms.At(i).Obj().(*types.Func)
+		if !ok {
+			continue
+		}
+		name := fn.Name()
+		idx := ctx.Conf.PresenceRegex.FindStringSubmatchIndex(name)
+		if idx == nil || idx[0] != 0 || idx[1] != len(name) || len(idx) < 4 {
+			continue
+		}
+		field := string(ctx.Conf.PresenceRegex.ExpandString(nil, ctx.Conf.PresenceTemplate, name, idx))
+		if field == "" || field != presenceBase {
+			continue
+		}
+		sig, ok := fn.Type().(*types.Signature)
+		if !ok || sig.Params().Len() != 0 || sig.Results().Len() != 1 {
+			continue
+		}
+		if basic, ok := sig.Results().At(0).Type().(*types.Basic); !ok || basic.Kind() != types.Bool {
+			continue
+		}
+		if !xtype.Accessible(fn, ctx.OutputPackagePath) {
+			continue
+		}
+		return sourceID.Code.Clone().Dot(name).Call()
+	}
+	return nil
+}
+
+func setterCollisionError(outputName string) string {
+	return fmt.Sprintf(`Multiple target members cover output field %q.
+
+Set goverter:struct:assign:prefer to "field" or "method" to choose which one wins, or disambiguate with an explicit goverter:map or goverter:ignore.`, outputName)
+}
+
+func isErrorType(t types.Type) bool {
+	named, ok := t.(*types.Named)
+	return ok && named.Obj().Name() == "error" && named.Obj().Pkg() == nil
 }
 
 func shouldCheckAgainstZero(ctx *MethodContext, s, t *xtype.Type, isUpdate, call bool) bool {
@@ -167,15 +469,16 @@ func shouldCheckAgainstZero(ctx *MethodContext, s, t *xtype.Type, isUpdate, call
 func mapField(
 	gen Generator,
 	ctx *MethodContext,
+	implicitName string,
 	targetField *types.Var,
 	sourceID *xtype.JenID,
-	source, target *xtype.Type,
+	source *xtype.Type,
+	mapping *config.FieldMapping,
 	additionalFieldSources []xtype.FieldSources,
 	errPath ErrorPath,
 ) (*xtype.JenID, *xtype.Type, []jen.Code, []*Path, bool, *Error) {
 	lift := []*Path{}
-	def := ctx.Field(target, targetField.Name())
-	pathString := def.Source
+	pathString := mapping.Source
 	if pathString == "." {
 		lift = append(lift, &Path{
 			Prefix:     ".",
@@ -189,7 +492,7 @@ func mapField(
 
 	var path []string
 	if pathString == "" {
-		sourceMatch, err := xtype.FindField(targetField.Name(), ctx.Conf.MatchIgnoreCase, source, additionalFieldSources)
+		sourceMatch, err := xtype.FindField(implicitName, ctx.Conf.MatchIgnoreCase, source, additionalFieldSources, sourceNameNormalizer(ctx))
 		if err != nil {
 			cause := fmt.Sprintf("Cannot match the target field with the source entry: %s.", err.Error())
 			skip := false
@@ -232,7 +535,7 @@ func mapField(
 				SourceType: "???",
 			}).Lift(lift...)
 		}
-		sourceMatch, err := xtype.FindExactField(nextSource, path[i])
+		sourceMatch, err := xtype.FindExactField(nextSource, path[i], sourceNameNormalizer(ctx))
 		if err == nil {
 			nextSource = sourceMatch.Type
 			nextIDCode = nextIDCode.Clone().Dot(sourceMatch.Name)
@@ -326,7 +629,7 @@ func parseAutoMap(ctx *MethodContext, source *xtype.Type) ([]xtype.FieldSources,
 		lift := []*Path{}
 		path := strings.Split(field, ".")
 		for _, part := range path {
-			field, err := xtype.FindExactField(innerSource, part)
+			field, err := xtype.FindExactField(innerSource, part, sourceNameNormalizer(ctx))
 			if err != nil {
 				return nil, NewError(err.Error()).Lift(&Path{
 					Prefix:     ".",

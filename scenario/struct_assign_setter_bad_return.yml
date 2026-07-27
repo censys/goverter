@@ -1,0 +1,30 @@
+input:
+    input.go: |
+        package execution
+
+        // goverter:converter
+        type Converter interface {
+            // goverter:struct:assign method
+            Convert(source Input) Output
+        }
+
+        type Input struct { Name string }
+        type Output struct { name string }
+        func (o *Output) SetName(name string) bool { o.name = name; return true }
+error: |-
+    Error while creating converter method:
+        @workdir/input.go:6
+        func (github.com/jmattheis/goverter/execution.Converter).Convert(source github.com/jmattheis/goverter/execution.Input) github.com/jmattheis/goverter/execution.Output
+            [source] github.com/jmattheis/goverter/execution.Input
+            [target] github.com/jmattheis/goverter/execution.Output
+
+    | github.com/jmattheis/goverter/execution.Input
+    |
+    source.???
+    target.SetName
+    |      |
+    |      | ???
+    |
+    | github.com/jmattheis/goverter/execution.Output
+
+    Setter method SetName must return nothing or a single error, but returns bool.

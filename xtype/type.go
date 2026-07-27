@@ -93,42 +93,78 @@ type SimpleStructField struct {
 // StructField returns the type of a struct field and its name upon successful match or
 // an error if it is not found. This method will also return a detailed error if matchIgnoreCase
 // is enabled and there are multiple non-exact matches.
-func (t Type) findAllFields(path []string, name string, ignoreCase bool) (*StructField, []*StructField) {
+// NameNormalizer rewrites a source accessor method name into the output field
+// name it provides (e.g. GetEmail -> Email), reporting whether the name is
+// recognized. It is built from the struct:assign:source setting; a nil normalizer
+// means no source-name normalization (exact matching only).
+type NameNormalizer func(methodName string) (string, bool)
+
+// findAllFields looks up a source member by output name. It returns the single
+// exact-name match (a field or method named exactly name), if any, plus the list
+// of inexact matches — matchIgnoreCase hits and struct:assign:source-normalized
+// accessors (e.g. getters). An exact match always wins; the inexact list is only
+// consulted when there is no exact match, and more than one inexact match is an
+// ambiguity the caller must reject.
+func (t Type) findAllFields(path []string, name string, ignoreCase bool, normalize NameNormalizer) (*StructField, []*StructField) {
 	if !t.Struct {
 		panic("trying to get field of non struct")
 	}
 
-	var matches []*StructField
-	handle := func(obj types.Object) *StructField {
+	var inexactMatches []*StructField
+	build := func(obj types.Object) *StructField {
+		newPath := append([]string{}, path...)
+		newPath = append(newPath, obj.Name())
+		return &StructField{Path: newPath, Type: TypeOf(obj.Type()).inStruct(&t, obj.Name())}
+	}
+	handleField := func(obj types.Object) *StructField {
 		exact := obj.Name() == name
-		if exact || (ignoreCase && strings.EqualFold(obj.Name(), name)) {
-			// exact match takes precedence over case-insensitive match
-			newPath := append([]string{}, path...)
-			newPath = append(newPath, obj.Name())
-			f := &StructField{Path: newPath, Type: TypeOf(obj.Type()).inStruct(&t, obj.Name())}
-			if exact {
-				return f
+		if exact {
+			return build(obj)
+		}
+		if ignoreCase && strings.EqualFold(obj.Name(), name) {
+			inexactMatches = append(inexactMatches, build(obj))
+		}
+		return nil
+	}
+	handleMethod := func(obj types.Object) *StructField {
+		if obj.Name() == name {
+			return build(obj)
+		}
+		if ignoreCase && strings.EqualFold(obj.Name(), name) {
+			inexactMatches = append(inexactMatches, build(obj))
+		}
+		// struct:assign:source recognizes accessor methods (e.g. getters) by
+		// normalizing their name to the output field name they provide. Such a
+		// match is inexact: an exact field or method name always wins.
+		if normalize != nil {
+			if normalized, ok := normalize(obj.Name()); ok {
+				if normalized == name || (ignoreCase && strings.EqualFold(normalized, name)) {
+					inexactMatches = append(inexactMatches, build(obj))
+				}
 			}
-			matches = append(matches, f)
 		}
 		return nil
 	}
 
 	for y := 0; y < t.StructType.NumFields(); y++ {
-		if exact := handle(t.StructType.Field(y)); exact != nil {
-			return exact, matches
+		if exact := handleField(t.StructType.Field(y)); exact != nil {
+			return exact, inexactMatches
 		}
 	}
 
 	if t.Named {
-		for y := 0; y < t.NamedType.NumMethods(); y++ {
-			if exact := handle(t.NamedType.Method(y)); exact != nil {
-				return exact, matches
+		// Use the pointer method set rather than NamedType.NumMethods() so that
+		// promoted methods from embedded types participate in matching, mirroring
+		// how struct:assign:setter and struct:assign:presence resolve methods.
+		ms := types.NewMethodSet(types.NewPointer(t.NamedType))
+		for y := 0; y < ms.Len(); y++ {
+			if exact := handleMethod(ms.At(y).Obj()); exact != nil {
+				return exact, inexactMatches
 			}
 		}
 	}
 
-	return nil, matches
+	return nil, inexactMatches
 }
 
 type FieldSources struct {
@@ -136,8 +172,12 @@ type FieldSources struct {
 	Type *Type
 }
 
-func FindExactField(source *Type, name string) (*SimpleStructField, error) {
-	exactMatch, _ := source.findAllFields(nil, name, false)
+func FindExactField(source *Type, name string, normalize NameNormalizer) (*SimpleStructField, error) {
+	exactMatch, fallback := source.findAllFields(nil, name, false, normalize)
+	if exactMatch == nil && len(fallback) == 1 {
+		// a single struct:assign:source (getter) match satisfies an exact lookup
+		exactMatch = fallback[0]
+	}
 	if exactMatch == nil {
 		return nil, fmt.Errorf("%q does not exist", name)
 	}
@@ -150,24 +190,24 @@ func (err *NoMatchError) Error() string {
 	return fmt.Sprintf("\"%s\" does not exist", err.Field)
 }
 
-func FindField(name string, ignoreCase bool, source *Type, additionalFieldSources []FieldSources) (*StructField, error) {
-	exactMatch, ignoreCaseMatches := source.findAllFields(nil, name, ignoreCase)
+func FindField(name string, ignoreCase bool, source *Type, additionalFieldSources []FieldSources, normalize NameNormalizer) (*StructField, error) {
+	exactMatch, inexactMatches := source.findAllFields(nil, name, ignoreCase, normalize)
 	var exactMatches []*StructField
 	if exactMatch != nil {
 		exactMatches = append(exactMatches, exactMatch)
 	}
 
 	for _, source := range additionalFieldSources {
-		sourceExactMatch, sourceIgnoreCaseMatches := source.Type.findAllFields(source.Path, name, ignoreCase)
+		sourceExactMatch, sourceInexactMatches := source.Type.findAllFields(source.Path, name, ignoreCase, normalize)
 		if sourceExactMatch != nil {
 			exactMatches = append(exactMatches, sourceExactMatch)
 		}
-		ignoreCaseMatches = append(ignoreCaseMatches, sourceIgnoreCaseMatches...)
+		inexactMatches = append(inexactMatches, sourceInexactMatches...)
 	}
 
 	matches := exactMatches
 	if len(matches) == 0 {
-		matches = ignoreCaseMatches
+		matches = inexactMatches
 	}
 
 	switch len(matches) {
